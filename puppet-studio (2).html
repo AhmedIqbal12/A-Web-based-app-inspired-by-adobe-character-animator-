@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Puppet Studio</title>
+<style>
+:root{--bg:#0e2326;--panel:#163338;--ink:#f3efe2;--mute:#8fb0ad;--gold:#ffb627;--rec:#ff5a4e;color-scheme:dark}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.4 Georgia,'Times New Roman',serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:22px 16px;gap:14px}
+h1{margin:0;font-size:26px;font-weight:700;letter-spacing:.2px}
+.hint{margin:0;color:var(--mute);font-size:14px;text-align:center;max-width:640px}
+.stage{position:relative;width:min(100%,900px);aspect-ratio:4/3;border-radius:18px;overflow:hidden;background:#000;box-shadow:0 12px 40px #0009}
+canvas{width:100%;height:100%;display:block}
+#cam{position:absolute;right:10px;bottom:10px;width:150px;aspect-ratio:4/3;object-fit:cover;border-radius:10px;transform:scaleX(-1);border:2px solid #fff5;transition:opacity .2s}
+#cam.off{opacity:0}
+#intro{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:#0e2326cc;text-align:center;padding:20px}
+#intro p{margin:0;color:var(--mute);max-width:420px}
+#rec{position:absolute;left:12px;top:12px;display:flex;gap:8px;align-items:center;background:#000a;padding:6px 14px;border-radius:99px;font-variant-numeric:tabular-nums}
+#rec i{width:10px;height:10px;border-radius:50%;background:var(--rec);animation:b 1s infinite}
+@keyframes b{50%{opacity:.2}}
+@media (prefers-reduced-motion:reduce){#rec i{animation:none}}
+.bar{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;justify-content:center;width:min(100%,900px);background:var(--panel);padding:12px 16px;border-radius:14px}
+button,.btn{font:inherit;font-weight:700;background:#24474d;color:var(--ink);border:0;border-radius:10px;padding:10px 16px;cursor:pointer;text-decoration:none}
+button:hover:not(:disabled),.btn:hover{background:#2f5b62}
+button:focus-visible,.btn:focus-visible,input:focus-visible{outline:3px solid var(--gold);outline-offset:2px}
+button:disabled{opacity:.4;cursor:not-allowed}
+#start{background:var(--gold);color:#241a00;font-size:18px;padding:14px 28px}
+#record{background:var(--rec);color:#2b0300}
+label{display:flex;align-items:center;gap:6px;color:var(--mute);font-size:14px}
+input[type=color]{width:30px;height:30px;border:0;padding:0;background:none;cursor:pointer}
+select{font:inherit;background:#24474d;color:var(--ink);border:0;border-radius:8px;padding:6px 8px}
+.meter{display:block;width:70px;height:10px;border-radius:5px;background:#0e2326;overflow:hidden}
+.meter i{display:block;height:100%;width:0;background:var(--gold)}
+#take{display:flex;flex-direction:column;align-items:center;gap:10px;width:min(100%,900px)}
+#take video{width:100%;border-radius:14px;background:#000}
+</style>
+</head>
+<body>
+<h1>Puppet Studio</h1>
+<div class="stage">
+  <canvas id="c" width="960" height="720"></canvas>
+  <video id="cam" playsinline muted autoplay></video>
+  <div id="intro">
+    <button id="start">Start camera and mic</button>
+    <p id="status">Your webcam tracks your face, hands and arms. Nothing leaves your computer.</p>
+  </div>
+  <div id="rec" hidden><i></i><b id="time">0:00</b></div>
+</div>
+<div class="bar">
+  <button id="calib" disabled>Calibrate head</button>
+  <button id="record" disabled>● Record</button>
+  <label>Mouth <select id="mouth"><option value="both">Face + voice</option><option value="voice">Voice only</option><option value="face">Face only</option></select></label>
+  <label>Mic <span class="meter"><i id="lvl"></i></span></label>
+  <label>Skin <input type="color" id="skin" value="#e8b48a"></label>
+  <label>Shirt <input type="color" id="shirt" value="#ff6b57"></label>
+  <label>Hair <input type="color" id="hair" value="#2a1d1a"></label>
+  <label>Backdrop <input type="color" id="bgc" value="#8fd3c8"></label>
+  <label><input type="checkbox" id="pip" checked> Camera preview</label>
+</div>
+<p class="hint">Sit back so your face, shoulders and hands are in frame. Look straight ahead and press Calibrate head. The recording captures the character and your voice, not your camera.</p>
+<div id="take" hidden>
+  <video id="playback" controls playsinline></video>
+  <a id="dl" class="btn">Download recording</a>
+</div>
+
+<script type="module">
+import {FilesetResolver,FaceLandmarker,HandLandmarker,PoseLandmarker} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $=id=>document.getElementById(id);
+const cv=$('c'),ctx=cv.getContext('2d'),W=960,H=720,cam=$('cam');
+const OL='#1d1a2b',MODELS='https://storage.googleapis.com/mediapipe-models/';
+const lerp=(a,b,t)=>a+(b-a)*t,clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const dist=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1]);
+const S={},sm=(k,v,a=.5)=>S[k]=S[k]===undefined?v:lerp(S[k],v,a);
+
+// character rig: shoulders, arm segment length, shoulder width
+const CH=[[392,522],[568,522]],SWC=176,L1=150,L2=150;
+const A=[0,1].map(s=>({x:CH[s][0]+(s?20:-20),y:CH[s][1]+270,f:null,miss:99}));
+
+let stream,face,hands,pose,fr,hd,po,running=false,needCal=true,base=null,faceLost=99;
+
+/* ---------- start: camera, mic, models ---------- */
+$('start').onclick=async()=>{
+  const st=$('status');$('start').disabled=true;
+  try{
+    try{stream=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480,facingMode:'user'},audio:{echoCancellation:true,noiseSuppression:true}})}
+    catch(e){stream=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}});st.textContent='No microphone access, so recordings will be silent. Loading models…'}
+    cam.srcObject=new MediaStream(stream.getVideoTracks());await cam.play();setupAudio();
+    st.textContent='Loading tracking models (about 10 seconds the first time)…';
+    const fs=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+    const mk=async(C,url,o)=>{for(const d of ['GPU','CPU']){try{return await C.createFromOptions(fs,{baseOptions:{modelAssetPath:MODELS+url,delegate:d},runningMode:'VIDEO',...o})}catch(e){if(d==='CPU')throw e}}};
+    face=await mk(FaceLandmarker,'face_landmarker/face_landmarker/float16/1/face_landmarker.task',{outputFaceBlendshapes:true,numFaces:1});
+    hands=await mk(HandLandmarker,'hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',{numHands:2});
+    pose=await mk(PoseLandmarker,'pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',{numPoses:1});
+    $('intro').hidden=true;$('calib').disabled=$('record').disabled=false;running=true;
+  }catch(e){st.textContent='Could not start: '+e.message+'. Allow camera access and check your connection.';$('start').disabled=false}
+};
+$('calib').onclick=()=>needCal=true;
+$('pip').onchange=e=>cam.classList.toggle('off',!e.target.checked);
+
+/* ---------- tracking -> rig values ---------- */
+function track(){
+  const vw=cam.videoWidth,vh=cam.videoHeight;
+  const L=fr?.faceLandmarks?.[0];faceLost=L?0:faceLost+1;
+  if(L){
+    const p=i=>L[i];
+    const midX=(p(234).x+p(454).x)/2;
+    const cx=(1-midX)*vw,cy=(p(10).y+p(152).y)/2*vh;
+    const fh=Math.hypot((p(152).x-p(10).x)*vw,(p(152).y-p(10).y)*vh);
+    const yawR=(p(1).x-midX)/Math.max(.01,Math.abs(p(454).x-p(234).x));
+    const pitR=(p(1).y-p(10).y)/Math.max(.01,p(152).y-p(10).y);
+    if(needCal||!base){base={cx,cy,fh,pitR};needCal=false}
+    sm('hx',clamp((cx-base.cx)/fh*250,-170,170),.45);
+    sm('hy',clamp((cy-base.cy)/fh*250,-120,120),.45);
+    sm('hs',clamp(1+(fh/base.fh-1)*.8,.85,1.25),.3);
+    sm('roll',clamp(-Math.atan2((p(263).y-p(33).y)*vh,(p(263).x-p(33).x)*vw),-.9,.9),.5);
+    sm('yx',clamp(-yawR*170,-55,55),.5);
+    sm('yy',clamp((pitR-base.pitR)*300,-45,45),.5);
+    const bs={};(fr.faceBlendshapes?.[0]?.categories||[]).forEach(c=>bs[c.categoryName]=c.score);
+    const g=k=>bs[k]||0;
+    sm('blL',g('eyeBlinkLeft'),.75);sm('blR',g('eyeBlinkRight'),.75);
+    sm('lxL',g('eyeLookInLeft')-g('eyeLookOutLeft'));sm('lxR',g('eyeLookOutRight')-g('eyeLookInRight'));
+    sm('ly',(g('eyeLookDownLeft')+g('eyeLookDownRight')-g('eyeLookUpLeft')-g('eyeLookUpRight'))/2);
+    sm('jaw',g('jawOpen'),.7);
+    sm('smile',(g('mouthSmileLeft')+g('mouthSmileRight'))/2);
+    sm('frown',(g('mouthFrownLeft')+g('mouthFrownRight'))/2);
+    sm('pucker',Math.max(g('mouthPucker'),g('mouthFunnel')*.6));
+    sm('biU',g('browInnerUp'));sm('boL',g('browOuterUpLeft'));sm('boR',g('browOuterUpRight'));
+    sm('bdL',g('browDownLeft'));sm('bdR',g('browDownRight'));
+  }
+  // arms and hands (mirrored: landmark 11 / 15 sit on the left of the screen)
+  const P=po?.landmarks?.[0];
+  const vis=i=>P&&P[i]&&P[i].visibility>.5,mp=i=>[(1-P[i].x)*vw,P[i].y*vh];
+  const sh=vis(11)&&vis(12)?[mp(11),mp(12)]:[[.3*vw,.85*vh],[.7*vw,.85*vh]];
+  const sw=Math.max(60,Math.abs(sh[1][0]-sh[0][0]));
+  const wr=[vis(15)?mp(15):null,vis(16)?mp(16):null];
+  const hs=(hd?.landmarks||[]).map(h=>h.map(q=>[(1-q.x)*vw,q.y*vh])).sort((a,b)=>a[0][0]-b[0][0]);
+  const mid=(sh[0][0]+sh[1][0])/2,found=[null,null];
+  hs.forEach((h,i)=>found[hs.length===2?i:(h[0][0]<mid?0:1)]=h);
+  for(let s=0;s<2;s++){
+    const h=found[s],a=A[s];let t=wr[s];
+    if(h){
+      t=h[0];
+      const k=52/Math.max(10,dist(h[0],h[9]),dist(h[5],h[17]));
+      const nf=h.map(q=>[(q[0]-h[0][0])*k,(q[1]-h[0][1])*k]);
+      a.f=a.f?a.f.map((q,i)=>[lerp(q[0],nf[i][0],.6),lerp(q[1],nf[i][1],.6)]):nf;a.miss=0;
+    }else if(++a.miss>6)a.f=null;
+    const T=t?[CH[s][0]+(t[0]-sh[s][0])/sw*SWC,CH[s][1]+(t[1]-sh[s][1])/sw*SWC]:[CH[s][0]+(s?20:-20),CH[s][1]+270];
+    a.x=lerp(a.x,T[0],.5);a.y=lerp(a.y,T[1],.5);
+  }
+}
+
+/* ---------- voice: loudness and vowel shape from the microphone ---------- */
+let AC,an,td,fd,floor=.004;
+const V={jaw:0,smile:0,pucker:0,lvl:0};
+function setupAudio(){
+  if(!stream.getAudioTracks().length)return;
+  AC=new AudioContext();AC.resume();
+  an=AC.createAnalyser();an.fftSize=1024;an.smoothingTimeConstant=.3;
+  AC.createMediaStreamSource(new MediaStream(stream.getAudioTracks())).connect(an);
+  td=new Float32Array(an.fftSize);fd=new Uint8Array(an.frequencyBinCount);
+}
+function voice(){
+  let jaw=0,smi=0,pk=0,lvl=0;
+  if(an){
+    an.getFloatTimeDomainData(td);
+    let e=0;for(const v of td)e+=v*v;
+    const rms=Math.sqrt(e/td.length);
+    floor=rms<floor?rms:lerp(floor,rms,.003);           // adapts to room noise
+    lvl=clamp((rms-floor*1.6-.004)/.07,0,1);
+    if(lvl>.02){
+      an.getByteFrequencyData(fd);
+      const bw=AC.sampleRate/an.fftSize;let num=0,den=0;
+      for(let i=Math.ceil(200/bw);i<Math.min(fd.length,3500/bw);i++){const w=Math.max(0,fd[i]-90);num+=i*bw*w;den+=w}
+      const cen=den>0?num/den:1000,t=clamp((cen-500)/1500,0,1); // 0 = "oo", .4 = "ah", 1 = "ee"
+      jaw=lvl*(.45+.55*Math.sin(Math.PI*t));
+      pk=lvl*clamp(1-t*2.5,0,1);
+      smi=lvl*clamp((t-.5)*2,0,1)*.8;
+    }
+  }
+  const k=(key,v)=>V[key]=lerp(V[key],v,v>V[key]?.7:.3);   // fast attack, slower release
+  k('jaw',jaw);k('smile',smi);k('pucker',pk);k('lvl',lvl);
+  $('lvl').style.width=(V.lvl*100)+'%';
+}
+let nextBlink=0;
+function blinkNow(){
+  const t=performance.now();
+  if(t>nextBlink+160)nextBlink=t+2000+Math.random()*3500;
+  return t>nextBlink?Math.sin((t-nextBlink)/160*Math.PI):0;
+}
+
+/* ---------- drawing ---------- */
+function strokes(lines,w,col){
+  for(const [lw,sc] of [[w+10,OL],[w,col]]){
+    ctx.lineWidth=lw;ctx.strokeStyle=sc;
+    for(const pts of lines){ctx.beginPath();pts.forEach((q,i)=>i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]));ctx.stroke()}
+  }
+}
+function draw(){
+  const c=ctx,skin=$('skin').value,shirt=$('shirt').value,hair=$('hair').value;
+  c.clearRect(0,0,W,H);c.fillStyle=$('bgc').value;c.fillRect(0,0,W,H);
+  c.fillStyle='#ffffff22';c.beginPath();c.ellipse(480,330,360,300,0,0,7);c.fill();
+  c.lineJoin=c.lineCap='round';c.strokeStyle=OL;
+
+  // torso + neck
+  const tm=performance.now(),idle=faceLost>15,ab=idle?blinkNow():0;   // idle = face not tracked: voice-only puppet
+  const hx=480+(idle?Math.sin(tm/2300)*10:S.hx||0),hy=300+(idle?Math.sin(tm/1700)*4+V.lvl*Math.sin(tm/85)*6:S.hy||0),sc=idle?1:S.hs||1;
+  c.fillStyle=shirt;c.lineWidth=6;c.beginPath();c.roundRect(355,470,250,400,70);c.fill();c.stroke();
+  strokes([[[480,495],[hx,hy+55]]],54,skin);
+
+  // head
+  c.save();c.translate(hx,hy);c.rotate(idle?Math.sin(tm/2900)*.05+V.lvl*Math.sin(tm/210)*.04:S.roll||0);c.scale(sc,sc);
+  c.fillStyle=skin;c.lineWidth=6;c.strokeStyle=OL;
+  for(const s of [-1,1]){c.beginPath();c.ellipse(s*106,8,18,26,0,0,7);c.fill();c.stroke()}
+  c.beginPath();c.ellipse(0,0,108,122,0,0,7);c.fill();c.stroke();
+  c.fillStyle=hair;c.beginPath();c.ellipse(0,0,111,125,0,Math.PI,2*Math.PI);
+  c.quadraticCurveTo(80,-70,10,-72);c.quadraticCurveTo(-60,-78,-111,0);c.closePath();c.fill();c.stroke();
+
+  // face features slide with head turn and tilt
+  if(!idle)c.translate(S.yx||0,S.yy||0);
+  for(const [s,k] of [[-1,'L'],[1,'R']]){
+    const ex=s*42,open=1-Math.max(idle?0:(S['bl'+k]||0),ab),ry=Math.max(3,27*open);
+    c.fillStyle='#fff';c.lineWidth=5;c.strokeStyle=OL;c.beginPath();c.ellipse(ex,-6,23,ry,0,0,7);c.fill();c.stroke();
+    const lx=idle?0:clamp(S['lx'+k]||0,-1,1)*9,ly=idle?0:clamp(S.ly||0,-1,1)*9*Math.min(1,ry/27);
+    c.fillStyle=OL;c.beginPath();c.ellipse(ex+lx,-6+ly,11,Math.max(2,Math.min(12,ry-3)),0,0,7);c.fill();
+    if(ry>12){c.fillStyle='#fff';c.beginPath();c.arc(ex+lx+4,-6+ly-4,3.5,0,7);c.fill()}
+    const up=idle?V.lvl*.5:(k==='L'?S.boL:S.boR)||0,dn=idle?0:S['bd'+k]||0,inn=idle?V.lvl*.3:S.biU||0;
+    c.lineWidth=9;c.strokeStyle=hair;c.beginPath();
+    c.moveTo(s*66,-52-18*up+14*dn);c.lineTo(s*22,-52-20*inn+18*dn);c.stroke();
+  }
+  c.fillStyle='#0003';c.beginPath();c.ellipse(0,24,8,6,0,0,7);c.fill();
+  const mode=$('mouth').value,uf=mode!=='voice'&&!idle,uv=mode!=='face'&&!!an;
+  const sl=Math.max(uf?S.smile||0:0,uv?V.smile:0),fn=uf?S.frown||0:0;
+  const pk=Math.max(uf?S.pucker||0:0,uv?V.pucker:0),o=Math.max(uf?S.jaw||0:0,uv?V.jaw:0)*58;
+  const w=clamp(38+26*sl-20*pk,16,70),cu=14*sl-12*fn;
+  c.save();c.translate(0,64);c.lineWidth=6;c.strokeStyle=OL;
+  c.beginPath();c.moveTo(-w,-cu*.8);c.quadraticCurveTo(0,cu*.6+2,w,-cu*.8);
+  if(o>4){c.quadraticCurveTo(0,o*1.9+cu*.6,-w,-cu*.8);c.fillStyle='#5b1a24';c.fill()}
+  c.stroke();c.restore();
+  c.restore();
+
+  // arms (two-bone IK to the tracked wrist) and hands
+  for(let s=0;s<2;s++){
+    const sd=s?1:-1,SP=CH[s],a=A[s];
+    const dx=a.x-SP[0],dy=a.y-SP[1],d=Math.hypot(dx,dy)||1,dd=Math.min(d,L1+L2-1),ux=dx/d,uy=dy/d;
+    const wx=SP[0]+ux*dd,wy=SP[1]+uy*dd;
+    const aa=(L1*L1-L2*L2+dd*dd)/(2*dd),hh=Math.sqrt(Math.max(0,L1*L1-aa*aa));
+    const bx=SP[0]+ux*aa,by=SP[1]+uy*aa;
+    const e1=[bx-uy*hh,by+ux*hh],e2=[bx+uy*hh,by-ux*hh];
+    const scr=e=>e[1]+.35*sd*(e[0]-SP[0]),el=scr(e1)>scr(e2)?e1:e2;
+    strokes([[SP,el]],42,shirt);strokes([[el,[wx,wy]]],34,skin);
+    c.save();c.translate(wx,wy);
+    if(a.f){
+      const f=a.f,palm=()=>{c.beginPath();[0,1,5,9,13,17].forEach((i,j)=>j?c.lineTo(f[i][0],f[i][1]):c.moveTo(f[i][0],f[i][1]));c.closePath()};
+      strokes([[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16],[17,18,19,20]].map(ch=>ch.map(i=>f[i])),10,skin);
+      palm();c.fillStyle=skin;c.lineWidth=6;c.strokeStyle=OL;c.fill();c.stroke();
+      palm();c.fill();
+    }else{
+      c.fillStyle=skin;c.lineWidth=6;c.strokeStyle=OL;c.beginPath();c.arc(0,10,26,0,7);c.fill();c.stroke();
+    }
+    c.restore();
+  }
+}
+
+/* ---------- main loop ---------- */
+let lastT=-1,frame=0;
+function loop(){
+  if(running&&cam.readyState>=2&&cam.currentTime!==lastT){
+    lastT=cam.currentTime;frame++;const t=performance.now();
+    try{fr=face.detectForVideo(cam,t);hd=hands.detectForVideo(cam,t);if(frame%2===0)po=pose.detectForVideo(cam,t)}catch(e){}
+    track();
+  }
+  voice();draw();requestAnimationFrame(loop);
+}
+loop();
+
+/* ---------- recording: canvas + microphone ---------- */
+let rec,chunks=[],t0,timer;
+$('record').onclick=()=>{
+  if(rec&&rec.state==='recording'){rec.stop();return}
+  const cs=cv.captureStream(30);
+  const out=new MediaStream([...cs.getVideoTracks(),...stream.getAudioTracks()]);
+  const mt=['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm','video/mp4'].find(t=>MediaRecorder.isTypeSupported(t));
+  rec=new MediaRecorder(out,mt?{mimeType:mt,videoBitsPerSecond:5e6}:{});chunks=[];
+  rec.ondataavailable=e=>e.data.size&&chunks.push(e.data);
+  rec.onstop=()=>{
+    clearInterval(timer);$('rec').hidden=true;$('record').textContent='● Record';
+    const type=rec.mimeType||'video/webm',url=URL.createObjectURL(new Blob(chunks,{type}));
+    $('playback').src=url;$('dl').href=url;$('dl').download='puppet-take.'+(type.includes('mp4')?'mp4':'webm');
+    $('take').hidden=false;$('take').scrollIntoView({behavior:'smooth'});
+  };
+  rec.start(250);t0=Date.now();$('rec').hidden=false;$('record').textContent='■ Stop';
+  timer=setInterval(()=>{const s=(Date.now()-t0)/1000|0;$('time').textContent=Math.floor(s/60)+':'+String(s%60).padStart(2,'0')},250);
+};
+</script>
+</body>
+</html>
